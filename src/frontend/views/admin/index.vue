@@ -1648,8 +1648,8 @@ const getUninstallCommand = () => {
     }
     const sudoPrefix = deleteTargetOs.value === 'mac' ? 'sudo ' : ''
     const ghUrl = buildGhRawUrl(proxy, '/huilang-me/cfsm-agent/main/install.sh')
-    // 兼容 systemd/dynamicUser 加固安装：顺带清理其配置、状态目录及 ~/.local/opt/CfServerMonitor（标准安装下这些路径不存在，无副作用）
-    return `curl -fsSL ${ghUrl} | ${sudoPrefix}sh -s -- uninstall${proxyParam} && { U="\${SUDO_USER:-}"; [ -n "$U" ] && [ "$U" != "root" ] || U="\${USER:-root}"; H="\$(getent passwd "$U" 2>/dev/null | cut -d: -f6)"; [ -n "$H" ] || H="\${HOME:-/root}"; rm -rf "$H/.local/opt/CfServerMonitor" /etc/cf-probe /var/lib/private/cf-probe /var/lib/cf-probe; }`
+    // 兼容 systemd/dynamicUser 加固安装：顺带清理其配置与状态目录（标准安装下这些路径不存在，无副作用）
+    return `curl -fsSL ${ghUrl} | ${sudoPrefix}sh -s -- uninstall${proxyParam} && rm -rf /etc/cf-probe /var/lib/cf-probe /var/lib/private/cf-probe`
   }
   if (deleteTargetOs.value === 'windows') {
     return `irm ${HOST}/cf-server-monitor.ps1 -OutFile cf-server-monitor.ps1; powershell -ExecutionPolicy Bypass -File .\\cf-server-monitor.ps1 uninstall`

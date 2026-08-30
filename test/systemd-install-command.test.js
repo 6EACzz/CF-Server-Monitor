@@ -22,24 +22,22 @@ const baseOptions = {
   ghProxy: ''
 }
 
-test('systemd hardened command: installs under ~/.local/opt/CfServerMonitor (resolved, mkdir -p)', () => {
+test('systemd hardened command: global install paths (binary + seed config)', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
 
-  // Resolve home to a static absolute path first, then create with mkdir -p
-  assert.match(cmd, /getent passwd "\$SUDO_USER"/)
-  assert.match(cmd, /USER_HOME="\$\{HOME:-\/root\}"/)
-  assert.match(cmd, /CFSM_DIR="\$\{USER_HOME\}\/\.local\/opt\/CfServerMonitor"/)
-  assert.match(cmd, /mkdir -p "\$CFSM_DIR"/)
-  assert.match(cmd, /CFSM_BIN="\$\{CFSM_DIR\}\/cf-probe"/)
+  // Binary -> /usr/local/bin, executable
+  assert.match(cmd, /curl -fsSL "https:\/\/github\.com\/huilang-me\/cfsm-agent\/releases\/latest\/download\/cf-probe-linux-\$\{ARCH\}" -o \/usr\/local\/bin\/cf-probe/)
+  assert.match(cmd, /chmod 0755 \/usr\/local\/bin\/cf-probe/)
 
-  // Binary lands under the resolved dir, not /usr/local/bin
-  assert.match(cmd, /curl -fsSL "https:\/\/github\.com\/huilang-me\/cfsm-agent\/releases\/latest\/download\/cf-probe-linux-\$\{ARCH\}" -o "\$CFSM_BIN"/)
-  assert.match(cmd, /chmod 0755 "\$CFSM_BIN"/)
-  assert.doesNotMatch(cmd, /\/usr\/local\/bin\/cf-probe/)
+  // Seed config -> /etc/cf-probe/config.conf, world readable
+  assert.match(cmd, /mkdir -p \/etc\/cf-probe/)
+  assert.match(cmd, /cat > \/etc\/cf-probe\/config\.conf <<'CFG'/)
+  assert.match(cmd, /chmod 0644 \/etc\/cf-probe\/config\.conf/)
 
-  // Seed config lives next to the binary
-  assert.match(cmd, /cat > "\$CFSM_DIR\/config\.conf" <<'CFG'/)
-  assert.match(cmd, /chmod 0600 "\$CFSM_DIR\/config\.conf"/)
+  // No per-user ownership/permission handling anywhere
+  assert.doesNotMatch(cmd, /chown/)
+  assert.doesNotMatch(cmd, /cf-probe:cf-probe/)
+  assert.doesNotMatch(cmd, /\.local\/opt\/CfServerMonitor/)
 
   // Service steps
   assert.match(cmd, /\/etc\/systemd\/system\/cf-probe\.service/)
@@ -48,14 +46,21 @@ test('systemd hardened command: installs under ~/.local/opt/CfServerMonitor (res
   assert.match(cmd, /systemctl restart cf-probe\.service/)
 })
 
-test('systemd hardened command: unit gets static paths baked in via sed placeholders', () => {
+test('systemd hardened command: unit uses only static literal paths (no variables/placeholders)', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
-  assert.match(cmd, /ExecStart=@CFSM_BIN@ run -config="\$\{STATE_DIRECTORY\}\/config\.conf"/)
-  assert.match(cmd, /\/bin\/install -m 0600 @CFSM_DIR@\/config\.conf "\$\{STATE_DIRECTORY\}\/config\.conf"/)
-  assert.match(cmd, /sed -i -e "s\|@CFSM_BIN@\|\$\{CFSM_BIN\}\|g" -e "s\|@CFSM_DIR@\|\$\{CFSM_DIR\}\|g" \/etc\/systemd\/system\/cf-probe\.service/)
+
+  assert.match(cmd, /ExecStart=\/usr\/local\/bin\/cf-probe run -config=\/var\/lib\/cf-probe\/config\.conf/)
+  assert.match(cmd, /ExecStartPre=\+\/bin\/sh -c 'test -f \/var\/lib\/cf-probe\/config\.conf \|\| \/bin\/install -m 0644 \/etc\/cf-probe\/config\.conf \/var\/lib\/cf-probe\/config\.conf'/)
+  assert.match(cmd, /StateDirectory=cf-probe/)
+
+  // the previously problematic parsing artifacts must be gone
+  assert.doesNotMatch(cmd, /\$\{STATE_DIRECTORY\}/)
+  assert.doesNotMatch(cmd, /@CFSM_BIN@/)
+  assert.doesNotMatch(cmd, /@CFSM_DIR@/)
+  assert.doesNotMatch(cmd, /sed -i/)
 })
 
-test('systemd hardened command: config block carries the install parameters', () => {
+test('systemd hardened command: config block carries the install parameters without indentation', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
   assert.match(cmd, /SERVER_ID="d508c1e2-99e5-4423-8b27-52c27bf7acd9"/)
   assert.match(cmd, /SECRET="s3cr3t-value"/)
@@ -71,25 +76,38 @@ test('systemd hardened command: config block carries the install parameters', ()
   assert.match(cmd, /CM_NODE="gd-cm-dualstack\.ip\.zstaticcdn\.com"/)
   assert.match(cmd, /INTERFACE="eth0,ens3"/)
   assert.doesNotMatch(cmd, /BD_NODE=/)
+
+  // 配置行不允许带缩进（每行直接 KEY="value"）
+  const configLines = cmd.split('\n').filter(line => /^(SERVER_ID|SECRET|WORKER_URL|COLLECT_INTERVAL|REPORT_INTERVAL|RESET_DAY|CONNECTION_MODE|PING_MODE|AUTO_UPDATE)=/.test(line))
+  assert.ok(configLines.length >= 9)
+  for (const line of configLines) {
+    assert.equal(line.match(/^(\s*)/)[1], '', `config line has leading whitespace: ${line}`)
+  }
 })
 
-test('systemd hardened command: unit uses DynamicUser with strong hardening', () => {
+test('systemd hardened command: unit uses DynamicUser with a moderate hardening set', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
   assert.match(cmd, /DynamicUser=yes/)
-  assert.match(cmd, /StateDirectory=cf-probe/)
   assert.match(cmd, /ProtectSystem=strict/)
-  // binary lives under the user home -> service must be able to read it
   assert.match(cmd, /ProtectHome=read-only/)
   assert.match(cmd, /NoNewPrivileges=yes/)
   assert.match(cmd, /PrivateTmp=yes/)
-  assert.match(cmd, /PrivateDevices=yes/)
-  assert.match(cmd, /MemoryDenyWriteExecute=yes/)
-  assert.match(cmd, /SystemCallFilter=@system-service/)
   assert.match(cmd, /RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK/)
   assert.match(cmd, /^CapabilityBoundingSet=$/m)
   assert.match(cmd, /^AmbientCapabilities=$/m)
   assert.match(cmd, /Restart=on-failure/)
   assert.match(cmd, /WantedBy=multi-user\.target/)
+
+  // 移除过于激进的选项（保留适度约束）
+  assert.doesNotMatch(cmd, /SystemCallFilter/)
+  assert.doesNotMatch(cmd, /MemoryDenyWriteExecute/)
+  assert.doesNotMatch(cmd, /LockPersonality/)
+  assert.doesNotMatch(cmd, /RestrictNamespaces/)
+  assert.doesNotMatch(cmd, /ProtectKernelModules/)
+  assert.doesNotMatch(cmd, /ProtectClock/)
+  assert.doesNotMatch(cmd, /ProtectHostname/)
+  assert.doesNotMatch(cmd, /ProtectProc=/) // no ProtectProc line at all
+  assert.doesNotMatch(cmd, /PrivateDevices=/)
 })
 
 test('systemd hardened command: ICMP mode grants only CAP_NET_RAW', () => {
@@ -142,7 +160,7 @@ test('single-line command: base64 round-trips the script and pipes to sh', () =>
   // Decoded content must be exactly the original script
   const decoded = Buffer.from(match[1], 'base64').toString('utf8')
   assert.equal(decoded, script)
-  assert.match(decoded, /mkdir -p "\$CFSM_DIR"/)
+  assert.match(decoded, /\/usr\/local\/bin\/cf-probe/)
   assert.match(decoded, /DynamicUser=yes/)
 
   // Decoded script must remain shell-syntactically valid

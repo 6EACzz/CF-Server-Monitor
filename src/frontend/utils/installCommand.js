@@ -3,19 +3,16 @@
 // bootstrap (`curl .../install.sh | sh -s -- install ...`).
 //
 // Behavior of the generated command (multi-line script):
-//   - resolves the install directory to a static absolute path first:
-//       <home>/.local/opt/CfServerMonitor/
-//     (home is derived from SUDO_USER / $HOME, then mkdir -p creates it)
-//   - downloads the release binary into <home>/.local/opt/CfServerMonitor/cf-probe
-//   - writes the seed config <home>/.local/opt/CfServerMonitor/config.conf
+//   - downloads the release binary into /usr/local/bin/cf-probe
+//   - writes the seed config /etc/cf-probe/config.conf (0644, world readable)
 //   - writes /etc/systemd/system/cf-probe.service running `cf-probe run`
-//     with DynamicUser=yes plus strong hardening (ProtectSystem=strict,
-//     no capabilities, seccomp, restricted address families, ...); the
-//     resolved absolute binary/config paths are baked into the unit
-//   - config used by the agent is a copy inside systemd's StateDirectory
-//     (owned by the dynamic user) so remote config updates and traffic.dat
-//     state remain writable; the seed config is re-copied by ExecStartPre
-//     when missing
+//     with DynamicUser=yes and a moderate hardening set (no per-user
+//     ownership handling: files are world readable/executable instead)
+//   - the agent's writable working copy (config updates + traffic.dat) lives
+//     in systemd's StateDirectory /var/lib/cf-probe, created and owned by
+//     the dynamic user; the seed config is copied there once by ExecStartPre
+//     when missing (root, mode 0644, no chown)
+//   - all paths in the unit are static literals (no shell/systemd variables)
 //   - AUTO_UPDATE is fixed to 0: a dynamic user cannot self-update (upstream
 //     update path shells out to `install` as root); rerun the command to upgrade
 //
@@ -31,7 +28,11 @@ export const COMMAND_FORMAT_SINGLE = 'single'
 
 export const CFSM_REPO_SLUG = 'huilang-me/cfsm-agent'
 export const CFSM_RELEASE_BASE = `https://github.com/${CFSM_REPO_SLUG}/releases/latest/download`
-export const CFSM_INSTALL_SUBDIR = '.local/opt/CfServerMonitor'
+
+export const CFSM_BIN_PATH = '/usr/local/bin/cf-probe'
+export const CFSM_CONFIG_PATH = '/etc/cf-probe/config.conf'
+export const CFSM_STATE_DIR = '/var/lib/cf-probe'
+export const CFSM_SERVICE_PATH = '/etc/systemd/system/cf-probe.service'
 
 const configValue = (value) => String(value ?? '').replace(/"/g, '\\"')
 
@@ -78,7 +79,8 @@ export const buildSystemdInstallCommand = (options = {}) => {
   const pingMode = options.pingMode === 'icmp' ? 'icmp' : 'tcp'
   const downloadBase = proxy ? `${proxy}/${CFSM_RELEASE_BASE}` : CFSM_RELEASE_BASE
 
-  const configBlock = buildSystemdConfigBlock({ ...options, workerUrl }).map(line => `  ${line}`).join('\n')
+  // 配置块不加缩进（保持 config.conf 内容干净）
+  const configBlock = buildSystemdConfigBlock({ ...options, workerUrl }).join('\n')
 
   const capabilityBlock = pingMode === 'icmp'
     ? '# ICMP ping 需要 CAP_NET_RAW（仅开放这一项）\nCapabilityBoundingSet=CAP_NET_RAW\nAmbientCapabilities=CAP_NET_RAW'
@@ -90,27 +92,14 @@ export const buildSystemdInstallCommand = (options = {}) => {
 # CF-Server-Monitor 探针安装 — systemd + DynamicUser 加固模式
 # ${serverLabel}服务器ID: ${options.serverId || ''}
 # 说明:
-#   - 安装目录: ~/.local/opt/CfServerMonitor/（脚本先解析成静态绝对路径，再 mkdir -p 创建）
-#   - 二进制: ~/${CFSM_INSTALL_SUBDIR}/cf-probe（解析后的绝对路径会写入 systemd 单元）
-#   - 种子配置: ~/${CFSM_INSTALL_SUBDIR}/config.conf（0600，仅属主可读）
-#   - 服务 cf-probe.service 以 DynamicUser=yes 运行并启用强安全约束
-#     （ProtectSystem=strict、seccomp、无 capabilities、受限地址族等）
+#   - 二进制: ${CFSM_BIN_PATH}（0755，全局可执行）
+#   - 配置: ${CFSM_CONFIG_PATH}（0644，全局可读，作为种子配置）
+#   - 运行期配置/流量计数的可写副本位于 StateDirectory ${CFSM_STATE_DIR}（动态用户所有，自动创建）
+#   - 服务 ${CFSM_SERVICE_PATH} 以 DynamicUser=yes 运行并启用适度安全约束
 #   - dynamicUser 下探针无法自我更新，AUTO_UPDATE 固定为 0；
-#     升级时重新执行本命令即可（流量计数会保留）
-# 注意: 动态用户需要能遍历/读取安装目录（home 需为 755 或对路径加 o+x），
-#       否则服务无法读取二进制和种子配置。
+#     升级时重新复制本命令执行即可（流量计数会保留）
 # ============================================================
 set -e
-
-# 0) 解析安装目录为静态绝对路径（systemd 单元不支持 ~ 展开，先解析再写入单元）
-if [ -n "\${SUDO_USER:-}" ] && [ "\$SUDO_USER" != "root" ] && getent passwd "\$SUDO_USER" >/dev/null 2>&1; then
-  USER_HOME="\$(getent passwd "\$SUDO_USER" | cut -d: -f6)"
-else
-  USER_HOME="\${HOME:-/root}"
-fi
-CFSM_DIR="\${USER_HOME}/${CFSM_INSTALL_SUBDIR}"
-mkdir -p "\$CFSM_DIR"
-CFSM_BIN="\${CFSM_DIR}/cf-probe"
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
@@ -123,18 +112,19 @@ case "$(uname -m)" in
   *) echo "不支持的架构: $(uname -m)" >&2; exit 1 ;;
 esac
 
-echo "[1/5] 下载 cf-probe-linux-\$ARCH 到 \$CFSM_BIN ..."
-curl -fsSL "${downloadBase}/cf-probe-linux-\${ARCH}" -o "\$CFSM_BIN"
-chmod 0755 "\$CFSM_BIN"
+echo "[1/4] 下载 cf-probe-linux-$ARCH 到 ${CFSM_BIN_PATH} ..."
+curl -fsSL "${downloadBase}/cf-probe-linux-\${ARCH}" -o ${CFSM_BIN_PATH}
+chmod 0755 ${CFSM_BIN_PATH}
 
-echo "[2/5] 写入种子配置 \$CFSM_DIR/config.conf ..."
-cat > "\$CFSM_DIR/config.conf" <<'CFG'
+echo "[2/4] 写入配置 ${CFSM_CONFIG_PATH} ..."
+mkdir -p /etc/cf-probe
+cat > ${CFSM_CONFIG_PATH} <<'CFG'
 ${configBlock}
 CFG
-chmod 0600 "\$CFSM_DIR/config.conf"
+chmod 0644 ${CFSM_CONFIG_PATH}
 
-echo "[3/5] 写入 systemd 服务 /etc/systemd/system/cf-probe.service ..."
-cat > /etc/systemd/system/cf-probe.service <<'UNIT'
+echo "[3/4] 写入 systemd 服务 ${CFSM_SERVICE_PATH} ..."
+cat > ${CFSM_SERVICE_PATH} <<'UNIT'
 [Unit]
 Description=CF Server Monitor Probe Agent (hardened)
 Documentation=https://github.com/${CFSM_REPO_SLUG}
@@ -145,41 +135,27 @@ Wants=network-online.target
 Type=simple
 DynamicUser=yes
 StateDirectory=cf-probe
-# 首次启动（或配置缺失/重装）时，以 root 将种子配置复制到 StateDirectory 并归属动态用户；
-# 运行期配置更新与 traffic.dat 由探针自身写入该目录（动态用户可写）
-ExecStartPre=+/bin/sh -c 'test -f "\${STATE_DIRECTORY}/config.conf" || { /bin/install -m 0600 @CFSM_DIR@/config.conf "\${STATE_DIRECTORY}/config.conf" && /bin/chown cf-probe:cf-probe "\${STATE_DIRECTORY}/config.conf" || /bin/chmod 0644 "\${STATE_DIRECTORY}/config.conf"; }'
-ExecStart=@CFSM_BIN@ run -config="\${STATE_DIRECTORY}/config.conf"
+# 首次启动（或配置缺失/重装）时，以 root 将种子配置复制到 StateDirectory；
+# 文件 0644 全局可读，动态用户无需专属归属处理；运行期更新由探针自身写入该目录
+ExecStartPre=+/bin/sh -c 'test -f ${CFSM_STATE_DIR}/config.conf || /bin/install -m 0644 ${CFSM_CONFIG_PATH} ${CFSM_STATE_DIR}/config.conf'
+ExecStart=${CFSM_BIN_PATH} run -config=${CFSM_STATE_DIR}/config.conf
 Restart=on-failure
 RestartSec=5
 Nice=15
 IOSchedulingClass=idle
 IOSchedulingPriority=7
 UMask=0077
-# --- 安全加固（DynamicUser 已隐含 NoNewPrivileges/RestrictSUIDSGID/ProtectSystem=strict/ProtectHome=read-only/RemoveIPC）---
+# --- 适度安全约束（DynamicUser 已隐含 NoNewPrivileges/RestrictSUIDSGID/ProtectSystem=strict/ProtectHome=read-only/RemoveIPC）---
 NoNewPrivileges=yes
 PrivateTmp=yes
-PrivateDevices=yes
 ProtectSystem=strict
-# 二进制位于用户主目录下，动态用户需能读取（read-only 而非 yes）
 ProtectHome=read-only
 ProtectKernelTunables=yes
-ProtectKernelModules=yes
 ProtectControlGroups=yes
-ProtectClock=yes
-ProtectHostname=yes
-ProtectKernelLogs=yes
-ProtectProc=invisible
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
-LockPersonality=yes
-MemoryDenyWriteExecute=yes
-SystemCallArchitectures=native
-SystemCallErrorNumber=EPERM
-SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 ${capabilityBlock}
-KeyringMode=private
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=cf-probe
@@ -187,20 +163,17 @@ SyslogIdentifier=cf-probe
 [Install]
 WantedBy=multi-user.target
 UNIT
-# 将解析后的静态绝对路径写入单元（systemd 不支持 ~/$HOME）
-sed -i -e "s|@CFSM_BIN@|\${CFSM_BIN}|g" -e "s|@CFSM_DIR@|\${CFSM_DIR}|g" /etc/systemd/system/cf-probe.service
 
-echo "[4/5] 启用并启动服务 ..."
+echo "[4/4] 启用并启动服务 ..."
 systemctl daemon-reload
 systemctl enable cf-probe.service >/dev/null 2>&1 || true
 # 删除运行期配置副本，让 ExecStartPre 用最新种子配置重建（保留 traffic.dat 流量计数）
 rm -f /var/lib/private/cf-probe/config.conf /var/lib/cf-probe/config.conf 2>/dev/null || true
 systemctl restart cf-probe.service
 
-echo "[5/5] 完成，当前服务状态："
+echo "完成，当前服务状态："
 systemctl --no-pager --lines=0 status cf-probe.service || true
 echo "日志查看: journalctl -u cf-probe -f"
-echo "安装目录: \${CFSM_DIR}"
 `
 }
 
