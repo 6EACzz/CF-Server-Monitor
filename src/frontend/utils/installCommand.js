@@ -4,17 +4,19 @@
 //
 // Behavior of the generated command (multi-line script):
 //   - downloads the release binary into /usr/local/bin/cf-probe
-//   - writes the seed config /etc/cf-probe/config.conf (0644, world readable)
-//   - writes /etc/systemd/system/cf-probe.service running `cf-probe run`
-//     with DynamicUser=yes and a moderate hardening set (no per-user
-//     ownership handling: files are world readable/executable instead)
-//   - the agent's writable working copy (config updates + traffic.dat) lives
-//     in systemd's StateDirectory /var/lib/cf-probe, created and owned by
-//     the dynamic user; the seed config is copied there once by ExecStartPre
-//     when missing (root, mode 0644, no chown)
-//   - all paths in the unit are static literals (no shell/systemd variables)
+//   - writes the config directly to /etc/cf-probe/config.conf (0644, world
+//     readable, so any service user can read it without per-user handling)
+//   - writes /etc/systemd/system/cf-probe.service running `cf-probe run
+//     -config=/etc/cf-probe/config.conf` with DynamicUser=yes and a moderate
+//     hardening set; all paths in the unit are static literals
+//   - default resource limits: CPUQuota 5% (single-core) / 10% (multi-core,
+//     auto-detected at install and hardcoded), MemoryMax=30M, CPUWeight=10
 //   - AUTO_UPDATE is fixed to 0: a dynamic user cannot self-update (upstream
 //     update path shells out to `install` as root); rerun the command to upgrade
+//
+// Note: under DynamicUser the /etc/cf-probe directory is not writable by the
+// service, so server-pushed config updates and traffic.dat persistence are
+// unavailable with this simple layout (config values are baked in at install).
 //
 // buildSingleLineInstallCommand() then encodes the script as Base64 so the
 // whole installation can be pasted as ONE line into an SSH session:
@@ -31,7 +33,6 @@ export const CFSM_RELEASE_BASE = `https://github.com/${CFSM_REPO_SLUG}/releases/
 
 export const CFSM_BIN_PATH = '/usr/local/bin/cf-probe'
 export const CFSM_CONFIG_PATH = '/etc/cf-probe/config.conf'
-export const CFSM_STATE_DIR = '/var/lib/cf-probe'
 export const CFSM_SERVICE_PATH = '/etc/systemd/system/cf-probe.service'
 
 const configValue = (value) => String(value ?? '').replace(/"/g, '\\"')
@@ -93,13 +94,12 @@ export const buildSystemdInstallCommand = (options = {}) => {
 # ${serverLabel}服务器ID: ${options.serverId || ''}
 # 说明:
 #   - 二进制: ${CFSM_BIN_PATH}（0755，全局可执行）
-#   - 配置: ${CFSM_CONFIG_PATH}（0644，全局可读，作为种子配置）
-#   - 运行期配置/流量计数的可写副本位于 StateDirectory ${CFSM_STATE_DIR}（动态用户所有，自动创建）
+#   - 配置: 直接使用 ${CFSM_CONFIG_PATH}（0644 全局可读，无拷贝/归属处理）
 #   - 服务 ${CFSM_SERVICE_PATH} 以 DynamicUser=yes 运行并启用适度安全约束
 #   - 资源限额: CPUQuota 5%（单核）/ 10%（多核，安装时自动检测核心数并硬编码进服务）、
 #     MemoryMax=30M、CPUWeight=10（较低调度权重）
 #   - dynamicUser 下探针无法自我更新，AUTO_UPDATE 固定为 0；
-#     升级时重新复制本命令执行即可（流量计数会保留）
+#     升级时重新复制本命令执行即可
 # ============================================================
 set -e
 
@@ -142,11 +142,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 DynamicUser=yes
-StateDirectory=cf-probe
-# 首次启动（或配置缺失/重装）时，以 root 将种子配置复制到 StateDirectory；
-# 文件 0644 全局可读，动态用户无需专属归属处理；运行期更新由探针自身写入该目录
-ExecStartPre=+/bin/sh -c 'test -f ${CFSM_STATE_DIR}/config.conf || /bin/install -m 0644 ${CFSM_CONFIG_PATH} ${CFSM_STATE_DIR}/config.conf'
-ExecStart=${CFSM_BIN_PATH} run -config=${CFSM_STATE_DIR}/config.conf
+# 配置直接使用全局可读的 /etc/cf-probe/config.conf（0644），无需专属用户归属处理
+ExecStart=${CFSM_BIN_PATH} run -config=${CFSM_CONFIG_PATH}
 Restart=on-failure
 RestartSec=5
 Nice=15
@@ -179,8 +176,6 @@ UNIT
 echo "[4/4] 启用并启动服务 ..."
 systemctl daemon-reload
 systemctl enable cf-probe.service >/dev/null 2>&1 || true
-# 删除运行期配置副本，让 ExecStartPre 用最新种子配置重建（保留 traffic.dat 流量计数）
-rm -f /var/lib/private/cf-probe/config.conf /var/lib/cf-probe/config.conf 2>/dev/null || true
 systemctl restart cf-probe.service
 
 echo "完成，当前服务状态："

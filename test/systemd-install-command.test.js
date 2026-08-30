@@ -22,22 +22,24 @@ const baseOptions = {
   ghProxy: ''
 }
 
-test('systemd hardened command: global install paths (binary + seed config)', () => {
+test('systemd hardened command: global install paths (binary + direct config)', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
 
   // Binary -> /usr/local/bin, executable
   assert.match(cmd, /curl -fsSL "https:\/\/github\.com\/huilang-me\/cfsm-agent\/releases\/latest\/download\/cf-probe-linux-\$\{ARCH\}" -o \/usr\/local\/bin\/cf-probe/)
   assert.match(cmd, /chmod 0755 \/usr\/local\/bin\/cf-probe/)
 
-  // Seed config -> /etc/cf-probe/config.conf, world readable
+  // Config written straight to /etc/cf-probe/config.conf, world readable
   assert.match(cmd, /mkdir -p \/etc\/cf-probe/)
   assert.match(cmd, /cat > \/etc\/cf-probe\/config\.conf <<'CFG'/)
   assert.match(cmd, /chmod 0644 \/etc\/cf-probe\/config\.conf/)
 
-  // No per-user ownership/permission handling anywhere
+  // No per-user ownership/permission handling, no state-dir copy machinery
   assert.doesNotMatch(cmd, /chown/)
   assert.doesNotMatch(cmd, /cf-probe:cf-probe/)
-  assert.doesNotMatch(cmd, /\.local\/opt\/CfServerMonitor/)
+  assert.doesNotMatch(cmd, /StateDirectory/)
+  assert.doesNotMatch(cmd, /ExecStartPre/)
+  assert.doesNotMatch(cmd, /\/var\/lib\/(private\/)?cf-probe/)
 
   // Service steps
   assert.match(cmd, /\/etc\/systemd\/system\/cf-probe\.service/)
@@ -46,32 +48,18 @@ test('systemd hardened command: global install paths (binary + seed config)', ()
   assert.match(cmd, /systemctl restart cf-probe\.service/)
 })
 
-test('systemd hardened command: unit uses only static literal paths (no variables/placeholders)', () => {
+test('systemd hardened command: unit uses the config file directly with static literal paths', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
 
-  assert.match(cmd, /ExecStart=\/usr\/local\/bin\/cf-probe run -config=\/var\/lib\/cf-probe\/config\.conf/)
-  assert.match(cmd, /ExecStartPre=\+\/bin\/sh -c 'test -f \/var\/lib\/cf-probe\/config\.conf \|\| \/bin\/install -m 0644 \/etc\/cf-probe\/config\.conf \/var\/lib\/cf-probe\/config\.conf'/)
-  assert.match(cmd, /StateDirectory=cf-probe/)
+  assert.match(cmd, /ExecStart=\/usr\/local\/bin\/cf-probe run -config=\/etc\/cf-probe\/config\.conf/)
+  assert.match(cmd, /DynamicUser=yes/)
 
-  // the previously problematic parsing artifacts must be gone
+  // no leftover copy/seeding machinery or systemd-expanded variables
   assert.doesNotMatch(cmd, /\$\{STATE_DIRECTORY\}/)
   assert.doesNotMatch(cmd, /@CFSM_BIN@/)
   assert.doesNotMatch(cmd, /@CFSM_DIR@/)
   assert.doesNotMatch(cmd, /sed -i/)
-})
-
-test('systemd hardened command: default CPU/memory limits with core detection', () => {
-  const cmd = buildSystemdInstallCommand(baseOptions)
-
-  // 核心数检测 → 硬编码配额：单核 5%，多核 10%
-  assert.match(cmd, /getconf _NPROCESSORS_ONLN 2>\/dev\/null \|\| nproc 2>\/dev\/null \|\| echo 1/)
-  assert.match(cmd, /CPU_QUOTA=10/)
-  assert.match(cmd, /CPU_QUOTA=5/)
-
-  // 写入服务的资源限额（CPUQuota 由脚本运行时替换为具体数值，最终文件中为纯数字）
-  assert.match(cmd, /CPUQuota="?\$\{CPU_QUOTA\}%"?/)
-  assert.match(cmd, /MemoryMax=30M/)
-  assert.match(cmd, /CPUWeight=10/)
+  assert.doesNotMatch(cmd, /ExecStartPre/)
 })
 
 test('systemd hardened command: config block carries the install parameters without indentation', () => {
@@ -99,9 +87,22 @@ test('systemd hardened command: config block carries the install parameters with
   }
 })
 
+test('systemd hardened command: default CPU/memory limits with core detection', () => {
+  const cmd = buildSystemdInstallCommand(baseOptions)
+
+  // 核心数检测 → 硬编码配额：单核 5%，多核 10%
+  assert.match(cmd, /getconf _NPROCESSORS_ONLN 2>\/dev\/null \|\| nproc 2>\/dev\/null \|\| echo 1/)
+  assert.match(cmd, /CPU_QUOTA=10/)
+  assert.match(cmd, /CPU_QUOTA=5/)
+
+  // 写入服务的资源限额（CPUQuota 由脚本运行时替换为具体数值，最终文件中为纯数字）
+  assert.match(cmd, /CPUQuota="?\$\{CPU_QUOTA\}%"?/)
+  assert.match(cmd, /MemoryMax=30M/)
+  assert.match(cmd, /CPUWeight=10/)
+})
+
 test('systemd hardened command: unit uses DynamicUser with a moderate hardening set', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
-  assert.match(cmd, /DynamicUser=yes/)
   assert.match(cmd, /ProtectSystem=strict/)
   assert.match(cmd, /ProtectHome=read-only/)
   assert.match(cmd, /NoNewPrivileges=yes/)
@@ -174,7 +175,7 @@ test('single-line command: base64 round-trips the script and pipes to sh', () =>
   // Decoded content must be exactly the original script
   const decoded = Buffer.from(match[1], 'base64').toString('utf8')
   assert.equal(decoded, script)
-  assert.match(decoded, /\/usr\/local\/bin\/cf-probe/)
+  assert.match(decoded, /\/usr\/local\/bin\/cf-probe run -config=\/etc\/cf-probe\/config\.conf/)
   assert.match(decoded, /DynamicUser=yes/)
 
   // Decoded script must remain shell-syntactically valid
