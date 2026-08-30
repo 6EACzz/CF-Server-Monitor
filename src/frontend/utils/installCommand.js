@@ -2,24 +2,36 @@
 // cf-probe agent, offered as an alternative to the upstream install.sh
 // bootstrap (`curl .../install.sh | sh -s -- install ...`).
 //
-// Behavior of the generated command:
-//   - downloads the release binary into /usr/local/bin/cf-probe
-//   - writes /etc/cf-probe/config.conf (root-only readable)
+// Behavior of the generated command (multi-line script):
+//   - resolves the install directory to a static absolute path first:
+//       <home>/.local/opt/CfServerMonitor/
+//     (home is derived from SUDO_USER / $HOME, then mkdir -p creates it)
+//   - downloads the release binary into <home>/.local/opt/CfServerMonitor/cf-probe
+//   - writes the seed config <home>/.local/opt/CfServerMonitor/config.conf
 //   - writes /etc/systemd/system/cf-probe.service running `cf-probe run`
 //     with DynamicUser=yes plus strong hardening (ProtectSystem=strict,
-//     no capabilities, seccomp, restricted address families, ...)
+//     no capabilities, seccomp, restricted address families, ...); the
+//     resolved absolute binary/config paths are baked into the unit
 //   - config used by the agent is a copy inside systemd's StateDirectory
 //     (owned by the dynamic user) so remote config updates and traffic.dat
-//     state remain writable; `/etc/cf-probe/config.conf` is the seed source
-//     re-copied by ExecStartPre when missing
+//     state remain writable; the seed config is re-copied by ExecStartPre
+//     when missing
 //   - AUTO_UPDATE is fixed to 0: a dynamic user cannot self-update (upstream
 //     update path shells out to `install` as root); rerun the command to upgrade
+//
+// buildSingleLineInstallCommand() then encodes the script as Base64 so the
+// whole installation can be pasted as ONE line into an SSH session:
+//   echo '<b64>' | base64 -d | sh
 
 export const INSTALL_METHOD_STANDARD = 'standard'
 export const INSTALL_METHOD_SYSTEMD = 'systemd'
 
+export const COMMAND_FORMAT_MULTI = 'multi'
+export const COMMAND_FORMAT_SINGLE = 'single'
+
 export const CFSM_REPO_SLUG = 'huilang-me/cfsm-agent'
 export const CFSM_RELEASE_BASE = `https://github.com/${CFSM_REPO_SLUG}/releases/latest/download`
+export const CFSM_INSTALL_SUBDIR = '.local/opt/CfServerMonitor'
 
 const configValue = (value) => String(value ?? '').replace(/"/g, '\\"')
 
@@ -78,14 +90,27 @@ export const buildSystemdInstallCommand = (options = {}) => {
 # CF-Server-Monitor 探针安装 — systemd + DynamicUser 加固模式
 # ${serverLabel}服务器ID: ${options.serverId || ''}
 # 说明:
-#   - 二进制安装到 /usr/local/bin/cf-probe
-#   - 配置写入 /etc/cf-probe/config.conf（仅 root 可读，作为种子配置）
+#   - 安装目录: ~/.local/opt/CfServerMonitor/（脚本先解析成静态绝对路径，再 mkdir -p 创建）
+#   - 二进制: ~/${CFSM_INSTALL_SUBDIR}/cf-probe（解析后的绝对路径会写入 systemd 单元）
+#   - 种子配置: ~/${CFSM_INSTALL_SUBDIR}/config.conf（0600，仅属主可读）
 #   - 服务 cf-probe.service 以 DynamicUser=yes 运行并启用强安全约束
 #     （ProtectSystem=strict、seccomp、无 capabilities、受限地址族等）
 #   - dynamicUser 下探针无法自我更新，AUTO_UPDATE 固定为 0；
-#     升级时重新复制本文命令执行即可（流量计数会保留）
+#     升级时重新执行本命令即可（流量计数会保留）
+# 注意: 动态用户需要能遍历/读取安装目录（home 需为 755 或对路径加 o+x），
+#       否则服务无法读取二进制和种子配置。
 # ============================================================
 set -e
+
+# 0) 解析安装目录为静态绝对路径（systemd 单元不支持 ~ 展开，先解析再写入单元）
+if [ -n "\${SUDO_USER:-}" ] && [ "\$SUDO_USER" != "root" ] && getent passwd "\$SUDO_USER" >/dev/null 2>&1; then
+  USER_HOME="\$(getent passwd "\$SUDO_USER" | cut -d: -f6)"
+else
+  USER_HOME="\${HOME:-/root}"
+fi
+CFSM_DIR="\${USER_HOME}/${CFSM_INSTALL_SUBDIR}"
+mkdir -p "\$CFSM_DIR"
+CFSM_BIN="\${CFSM_DIR}/cf-probe"
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH=amd64 ;;
@@ -98,16 +123,15 @@ case "$(uname -m)" in
   *) echo "不支持的架构: $(uname -m)" >&2; exit 1 ;;
 esac
 
-echo "[1/5] 下载 cf-probe-linux-$ARCH ..."
-curl -fsSL "${downloadBase}/cf-probe-linux-\${ARCH}" -o /usr/local/bin/cf-probe
-chmod 0755 /usr/local/bin/cf-probe
+echo "[1/5] 下载 cf-probe-linux-\$ARCH 到 \$CFSM_BIN ..."
+curl -fsSL "${downloadBase}/cf-probe-linux-\${ARCH}" -o "\$CFSM_BIN"
+chmod 0755 "\$CFSM_BIN"
 
-echo "[2/5] 写入配置 /etc/cf-probe/config.conf ..."
-install -d -m 0755 /etc/cf-probe
-cat > /etc/cf-probe/config.conf <<'CFG'
+echo "[2/5] 写入种子配置 \$CFSM_DIR/config.conf ..."
+cat > "\$CFSM_DIR/config.conf" <<'CFG'
 ${configBlock}
 CFG
-chmod 0600 /etc/cf-probe/config.conf
+chmod 0600 "\$CFSM_DIR/config.conf"
 
 echo "[3/5] 写入 systemd 服务 /etc/systemd/system/cf-probe.service ..."
 cat > /etc/systemd/system/cf-probe.service <<'UNIT'
@@ -123,8 +147,8 @@ DynamicUser=yes
 StateDirectory=cf-probe
 # 首次启动（或配置缺失/重装）时，以 root 将种子配置复制到 StateDirectory 并归属动态用户；
 # 运行期配置更新与 traffic.dat 由探针自身写入该目录（动态用户可写）
-ExecStartPre=+/bin/sh -c 'test -f "\${STATE_DIRECTORY}/config.conf" || { /bin/install -m 0600 /etc/cf-probe/config.conf "\${STATE_DIRECTORY}/config.conf" && /bin/chown cf-probe:cf-probe "\${STATE_DIRECTORY}/config.conf" || /bin/chmod 0644 "\${STATE_DIRECTORY}/config.conf"; }'
-ExecStart=/usr/local/bin/cf-probe run -config="\${STATE_DIRECTORY}/config.conf"
+ExecStartPre=+/bin/sh -c 'test -f "\${STATE_DIRECTORY}/config.conf" || { /bin/install -m 0600 @CFSM_DIR@/config.conf "\${STATE_DIRECTORY}/config.conf" && /bin/chown cf-probe:cf-probe "\${STATE_DIRECTORY}/config.conf" || /bin/chmod 0644 "\${STATE_DIRECTORY}/config.conf"; }'
+ExecStart=@CFSM_BIN@ run -config="\${STATE_DIRECTORY}/config.conf"
 Restart=on-failure
 RestartSec=5
 Nice=15
@@ -136,7 +160,8 @@ NoNewPrivileges=yes
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectSystem=strict
-ProtectHome=yes
+# 二进制位于用户主目录下，动态用户需能读取（read-only 而非 yes）
+ProtectHome=read-only
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectControlGroups=yes
@@ -162,16 +187,36 @@ SyslogIdentifier=cf-probe
 [Install]
 WantedBy=multi-user.target
 UNIT
+# 将解析后的静态绝对路径写入单元（systemd 不支持 ~/$HOME）
+sed -i -e "s|@CFSM_BIN@|\${CFSM_BIN}|g" -e "s|@CFSM_DIR@|\${CFSM_DIR}|g" /etc/systemd/system/cf-probe.service
 
 echo "[4/5] 启用并启动服务 ..."
 systemctl daemon-reload
 systemctl enable cf-probe.service >/dev/null 2>&1 || true
-# 删除运行期配置副本，让 ExecStartPre 用 /etc 最新种子配置重建（保留 traffic.dat 流量计数）
+# 删除运行期配置副本，让 ExecStartPre 用最新种子配置重建（保留 traffic.dat 流量计数）
 rm -f /var/lib/private/cf-probe/config.conf /var/lib/cf-probe/config.conf 2>/dev/null || true
 systemctl restart cf-probe.service
 
 echo "[5/5] 完成，当前服务状态："
 systemctl --no-pager --lines=0 status cf-probe.service || true
 echo "日志查看: journalctl -u cf-probe -f"
+echo "安装目录: \${CFSM_DIR}"
 `
+}
+
+const utf8ToBase64 = (text) => {
+  const bytes = new TextEncoder().encode(text)
+  let binary = ''
+  const chunkSize = 0x8000
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize))
+  }
+  return btoa(binary)
+}
+
+// 将多行脚本压缩为单行命令：Base64 编码后管道解码并交给 sh 执行，
+// 便于快速复制到服务器 SSH 会话中粘贴安装。
+export const buildSingleLineInstallCommand = (scriptText) => {
+  const encoded = utf8ToBase64(String(scriptText || ''))
+  return `echo '${encoded}' | base64 -d | sh`
 }

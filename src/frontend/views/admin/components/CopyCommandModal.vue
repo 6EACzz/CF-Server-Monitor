@@ -23,6 +23,21 @@
           </select>
           <input v-else type="text" :value="trans.installMethodStandard" class="form-input" disabled>
         </div>
+
+        <div v-if="installMethod === 'systemd' && targetOs !== 'windows'" class="form-group flex-1">
+          <label class="form-label">
+            {{ trans.commandFormat }}
+            <HelpTooltip :text="trans.commandFormatSingleTip" />
+          </label>
+          <select
+            :value="commandFormat"
+            class="form-select"
+            @change="$emit('update:command-format', $event.target.value)"
+          >
+            <option value="multi">{{ trans.commandFormatMulti }}</option>
+            <option value="single">{{ trans.commandFormatSingle }}</option>
+          </select>
+        </div>
       </div>
 
       <div v-if="installMethod === 'systemd' && targetOs !== 'windows'" class="warning-box mb-3">
@@ -149,6 +164,7 @@ const props = defineProps({
   currentServerName: { type: String, default: '' },
   targetOs: { type: String, default: 'linux' },
   installMethod: { type: String, default: 'standard' },
+  commandFormat: { type: String, default: 'multi' },
   installGhProxy: { type: String, default: '' },
   collectInterval: { type: [Number, String], default: 0 },
   reportInterval: { type: [Number, String], default: 60 },
@@ -174,6 +190,7 @@ const emit = defineEmits([
   'open-edit-from-copy',
   'update:target-os',
   'update:install-method',
+  'update:command-format',
   'update:install-gh-proxy'
 ])
 

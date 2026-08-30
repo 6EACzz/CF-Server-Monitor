@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 
-import { buildSystemdInstallCommand, CFSM_REPO_SLUG } from '../src/frontend/utils/installCommand.js'
+import { buildSingleLineInstallCommand, buildSystemdInstallCommand } from '../src/frontend/utils/installCommand.js'
 
 const baseOptions = {
   host: 'https://status.6eac.top',
@@ -22,24 +22,37 @@ const baseOptions = {
   ghProxy: ''
 }
 
-test('systemd hardened command: binary download, config and service paths', () => {
+test('systemd hardened command: installs under ~/.local/opt/CfServerMonitor (resolved, mkdir -p)', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
 
-  // Binary download -> /usr/local/bin
-  assert.match(cmd, /curl -fsSL "https:\/\/github\.com\/huilang-me\/cfsm-agent\/releases\/latest\/download\/cf-probe-linux-\$\{ARCH\}" -o \/usr\/local\/bin\/cf-probe/)
-  assert.match(cmd, /chmod 0755 \/usr\/local\/bin\/cf-probe/)
+  // Resolve home to a static absolute path first, then create with mkdir -p
+  assert.match(cmd, /getent passwd "\$SUDO_USER"/)
+  assert.match(cmd, /USER_HOME="\$\{HOME:-\/root\}"/)
+  assert.match(cmd, /CFSM_DIR="\$\{USER_HOME\}\/\.local\/opt\/CfServerMonitor"/)
+  assert.match(cmd, /mkdir -p "\$CFSM_DIR"/)
+  assert.match(cmd, /CFSM_BIN="\$\{CFSM_DIR\}\/cf-probe"/)
 
-  // Config file location
-  assert.match(cmd, /\/etc\/cf-probe\/config\.conf/)
-  assert.match(cmd, /install -d -m 0755 \/etc\/cf-probe/)
+  // Binary lands under the resolved dir, not /usr/local/bin
+  assert.match(cmd, /curl -fsSL "https:\/\/github\.com\/huilang-me\/cfsm-agent\/releases\/latest\/download\/cf-probe-linux-\$\{ARCH\}" -o "\$CFSM_BIN"/)
+  assert.match(cmd, /chmod 0755 "\$CFSM_BIN"/)
+  assert.doesNotMatch(cmd, /\/usr\/local\/bin\/cf-probe/)
 
-  // Service unit location
+  // Seed config lives next to the binary
+  assert.match(cmd, /cat > "\$CFSM_DIR\/config\.conf" <<'CFG'/)
+  assert.match(cmd, /chmod 0600 "\$CFSM_DIR\/config\.conf"/)
+
+  // Service steps
   assert.match(cmd, /\/etc\/systemd\/system\/cf-probe\.service/)
-
-  // systemd-service enable/start steps
   assert.match(cmd, /systemctl daemon-reload/)
   assert.match(cmd, /systemctl enable cf-probe\.service/)
   assert.match(cmd, /systemctl restart cf-probe\.service/)
+})
+
+test('systemd hardened command: unit gets static paths baked in via sed placeholders', () => {
+  const cmd = buildSystemdInstallCommand(baseOptions)
+  assert.match(cmd, /ExecStart=@CFSM_BIN@ run -config="\$\{STATE_DIRECTORY\}\/config\.conf"/)
+  assert.match(cmd, /\/bin\/install -m 0600 @CFSM_DIR@\/config\.conf "\$\{STATE_DIRECTORY\}\/config\.conf"/)
+  assert.match(cmd, /sed -i -e "s\|@CFSM_BIN@\|\$\{CFSM_BIN\}\|g" -e "s\|@CFSM_DIR@\|\$\{CFSM_DIR\}\|g" \/etc\/systemd\/system\/cf-probe\.service/)
 })
 
 test('systemd hardened command: config block carries the install parameters', () => {
@@ -64,10 +77,9 @@ test('systemd hardened command: unit uses DynamicUser with strong hardening', ()
   const cmd = buildSystemdInstallCommand(baseOptions)
   assert.match(cmd, /DynamicUser=yes/)
   assert.match(cmd, /StateDirectory=cf-probe/)
-  assert.match(cmd, /ExecStart=\/usr\/local\/bin\/cf-probe run -config="\$\{STATE_DIRECTORY\}\/config\.conf"/)
-  assert.match(cmd, /ExecStartPre=\+\/bin\/sh -c 'test -f "\$\{STATE_DIRECTORY\}\/config\.conf"/)
   assert.match(cmd, /ProtectSystem=strict/)
-  assert.match(cmd, /ProtectHome=yes/)
+  // binary lives under the user home -> service must be able to read it
+  assert.match(cmd, /ProtectHome=read-only/)
   assert.match(cmd, /NoNewPrivileges=yes/)
   assert.match(cmd, /PrivateTmp=yes/)
   assert.match(cmd, /PrivateDevices=yes/)
@@ -116,4 +128,26 @@ test('systemd hardened command: values are quoted/escaped in the KV config', () 
     customCt: 'node.example'
   })
   assert.match(cmd, /SECRET="ab\\"cd"/)
+})
+
+test('single-line command: base64 round-trips the script and pipes to sh', () => {
+  const script = buildSystemdInstallCommand(baseOptions)
+  const line = buildSingleLineInstallCommand(script)
+
+  // One single line: echo '<b64>' | base64 -d | sh
+  assert.equal(line.split('\n').length, 1)
+  const match = line.match(/^echo '([A-Za-z0-9+/=]+)' \| base64 -d \| sh$/)
+  assert.ok(match, `unexpected single-line format: ${line.slice(0, 80)}...`)
+
+  // Decoded content must be exactly the original script
+  const decoded = Buffer.from(match[1], 'base64').toString('utf8')
+  assert.equal(decoded, script)
+  assert.match(decoded, /mkdir -p "\$CFSM_DIR"/)
+  assert.match(decoded, /DynamicUser=yes/)
+
+  // Decoded script must remain shell-syntactically valid
+  const bash = spawnSync('bash', ['-n', '-s'], { input: decoded })
+  if (!bash.error) {
+    assert.equal(bash.status, 0, `bash -n failed on decoded script:\n${bash.stderr}`)
+  }
 })
