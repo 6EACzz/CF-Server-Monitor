@@ -96,6 +96,8 @@ export const buildSystemdInstallCommand = (options = {}) => {
 #   - 配置: ${CFSM_CONFIG_PATH}（0644，全局可读，作为种子配置）
 #   - 运行期配置/流量计数的可写副本位于 StateDirectory ${CFSM_STATE_DIR}（动态用户所有，自动创建）
 #   - 服务 ${CFSM_SERVICE_PATH} 以 DynamicUser=yes 运行并启用适度安全约束
+#   - 资源限额: CPUQuota 5%（单核）/ 10%（多核，安装时自动检测核心数并硬编码进服务）、
+#     MemoryMax=30M、CPUWeight=10（较低调度权重）
 #   - dynamicUser 下探针无法自我更新，AUTO_UPDATE 固定为 0；
 #     升级时重新复制本命令执行即可（流量计数会保留）
 # ============================================================
@@ -124,7 +126,13 @@ CFG
 chmod 0644 ${CFSM_CONFIG_PATH}
 
 echo "[3/4] 写入 systemd 服务 ${CFSM_SERVICE_PATH} ..."
-cat > ${CFSM_SERVICE_PATH} <<'UNIT'
+# 检测 CPU 核心数：单核限 5%，多核限 10%（结果直接硬编码进服务配置）
+if [ "$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || echo 1)" -gt 1 ]; then
+  CPU_QUOTA=10
+else
+  CPU_QUOTA=5
+fi
+cat > ${CFSM_SERVICE_PATH} <<UNIT
 [Unit]
 Description=CF Server Monitor Probe Agent (hardened)
 Documentation=https://github.com/${CFSM_REPO_SLUG}
@@ -142,6 +150,10 @@ ExecStart=${CFSM_BIN_PATH} run -config=${CFSM_STATE_DIR}/config.conf
 Restart=on-failure
 RestartSec=5
 Nice=15
+# --- 资源限额（CPU 配额由安装脚本按核心数硬编码；较低调度权重；内存上限 30M）---
+CPUQuota=\${CPU_QUOTA}%
+MemoryMax=30M
+CPUWeight=10
 IOSchedulingClass=idle
 IOSchedulingPriority=7
 UMask=0077

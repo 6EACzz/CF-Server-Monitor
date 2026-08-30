@@ -60,6 +60,20 @@ test('systemd hardened command: unit uses only static literal paths (no variable
   assert.doesNotMatch(cmd, /sed -i/)
 })
 
+test('systemd hardened command: default CPU/memory limits with core detection', () => {
+  const cmd = buildSystemdInstallCommand(baseOptions)
+
+  // 核心数检测 → 硬编码配额：单核 5%，多核 10%
+  assert.match(cmd, /getconf _NPROCESSORS_ONLN 2>\/dev\/null \|\| nproc 2>\/dev\/null \|\| echo 1/)
+  assert.match(cmd, /CPU_QUOTA=10/)
+  assert.match(cmd, /CPU_QUOTA=5/)
+
+  // 写入服务的资源限额（CPUQuota 由脚本运行时替换为具体数值，最终文件中为纯数字）
+  assert.match(cmd, /CPUQuota="?\$\{CPU_QUOTA\}%"?/)
+  assert.match(cmd, /MemoryMax=30M/)
+  assert.match(cmd, /CPUWeight=10/)
+})
+
 test('systemd hardened command: config block carries the install parameters without indentation', () => {
   const cmd = buildSystemdInstallCommand(baseOptions)
   assert.match(cmd, /SERVER_ID="d508c1e2-99e5-4423-8b27-52c27bf7acd9"/)
@@ -128,7 +142,7 @@ test('systemd hardened command: heredocs are closed and the script is shell-synt
   const cmd = buildSystemdInstallCommand(baseOptions)
   assert.match(cmd, /<<'CFG'/)
   assert.match(cmd, /^CFG$/m)
-  assert.match(cmd, /<<'UNIT'/)
+  assert.match(cmd, /<<UNIT/)
   assert.match(cmd, /^UNIT$/m)
 
   const bash = spawnSync('bash', ['-n', '-s'], { input: cmd })
