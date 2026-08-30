@@ -8,6 +8,29 @@
 
       <div class="form-row">
         <div class="form-group flex-1">
+          <label class="form-label">
+            {{ trans.installMethod }}
+            <HelpTooltip :text="trans.installMethodSystemdTip" />
+          </label>
+          <select
+            v-if="targetOs !== 'windows'"
+            :value="installMethod"
+            class="form-select"
+            @change="$emit('update:install-method', $event.target.value)"
+          >
+            <option value="standard">{{ trans.installMethodStandard }}</option>
+            <option value="systemd">{{ trans.installMethodSystemd }}</option>
+          </select>
+          <input v-else type="text" :value="trans.installMethodStandard" class="form-input" disabled>
+        </div>
+      </div>
+
+      <div v-if="installMethod === 'systemd' && targetOs !== 'windows'" class="warning-box mb-3">
+        <p class="text-secondary text-sm line-height-1-6">{{ trans.installMethodSystemdTip }}</p>
+      </div>
+
+      <div class="form-row">
+        <div class="form-group flex-1">
           <label class="form-label">{{ trans.targetOs }}</label>
           <select :value="targetOs" class="form-select" @change="$emit('update:target-os', $event.target.value)">
             <option value="linux">Linux/OpenWrt/Synology DSM/FreeBSD/macOS</option>
@@ -125,6 +148,7 @@ const props = defineProps({
   show: { type: Boolean, default: false },
   currentServerName: { type: String, default: '' },
   targetOs: { type: String, default: 'linux' },
+  installMethod: { type: String, default: 'standard' },
   installGhProxy: { type: String, default: '' },
   collectInterval: { type: [Number, String], default: 0 },
   reportInterval: { type: [Number, String], default: 60 },
@@ -149,6 +173,7 @@ const emit = defineEmits([
   'copy-cmd',
   'open-edit-from-copy',
   'update:target-os',
+  'update:install-method',
   'update:install-gh-proxy'
 ])
 

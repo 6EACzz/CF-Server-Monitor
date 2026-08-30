@@ -11,11 +11,15 @@ public/config.json
 node_modules/
 yarn.lock
 pnpm-lock.yaml
+.npm-cache/
 
-# 环境变量
+# 环境变量与本地密钥（真实密钥一律不入库，只提交示例）
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
 
 # IDE
 .vscode/

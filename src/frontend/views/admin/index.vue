@@ -242,6 +242,7 @@
         :show="showCopyModal"
         :current-server-name="currentServerName"
         :target-os="targetOs"
+        :install-method="installMethod"
         :install-gh-proxy="installGhProxy"
         :collect-interval="collectInterval"
         :report-interval="reportInterval"
@@ -262,6 +263,7 @@
         @close="closeCopyModal"
         @copy-cmd="copyCustomCmd"
         @update:target-os="targetOs = $event"
+        @update:install-method="installMethod = $event"
         @update:install-gh-proxy="installGhProxy = $event"
         @open-edit-from-copy="openEditModalFromCopy"
       />
@@ -568,6 +570,7 @@ import { adminApi, login, logout as apiLogout, upgradeDatabase, clearHistory, ge
 import { hasMultipleApiBases } from '../../utils/config.js'
 import { t, useTranslation } from '../../utils/i18n'
 import { PING_NODE_FIELDS, validatePingNode } from '../../utils/pingNode.js'
+import { buildSystemdInstallCommand, INSTALL_METHOD_STANDARD, INSTALL_METHOD_SYSTEMD } from '../../utils/installCommand.js'
 import { normalizeDisplayMode, resolveDisplayMode } from '../../utils/displayMode.js'
 import { applyMikusThemeOptions } from '../../utils/themeOptions.js'
 import { FRONTEND_WS_TIMEOUT_MINUTES_MAX, HISTORY } from '../../utils/constants.js'
@@ -1078,6 +1081,7 @@ const showCopyModal = ref(false)
 const copyServerId = ref('')
 const currentServerName = ref('')
 const targetOs = ref('linux')
+const installMethod = ref(INSTALL_METHOD_STANDARD)
 const installGhProxy = ref('')
 const collectInterval = ref(0)
 const reportInterval = ref(60)
@@ -1641,7 +1645,8 @@ const getUninstallCommand = () => {
     }
     const sudoPrefix = deleteTargetOs.value === 'mac' ? 'sudo ' : ''
     const ghUrl = buildGhRawUrl(proxy, '/huilang-me/cfsm-agent/main/install.sh')
-    return `curl -fsSL ${ghUrl} | ${sudoPrefix}sh -s -- uninstall${proxyParam}`
+    // 兼容 systemd/dynamicUser 加固安装：顺带清理其配置与状态目录（标准安装下这些路径不存在，无副作用）
+    return `curl -fsSL ${ghUrl} | ${sudoPrefix}sh -s -- uninstall${proxyParam} && rm -rf /etc/cf-probe /var/lib/private/cf-probe /var/lib/cf-probe`
   }
   if (deleteTargetOs.value === 'windows') {
     return `irm ${HOST}/cf-server-monitor.ps1 -OutFile cf-server-monitor.ps1; powershell -ExecutionPolicy Bypass -File .\\cf-server-monitor.ps1 uninstall`
@@ -1661,6 +1666,7 @@ const copyCmd = (serverId) => {
   copyServerId.value = serverId
   currentServerName.value = server?.name || ''
   targetOs.value = 'linux'
+  installMethod.value = INSTALL_METHOD_STANDARD
   installGhProxy.value = ''
   collectInterval.value = server?.collect_interval ?? 0
   reportInterval.value = server?.report_interval || 60
@@ -1691,6 +1697,25 @@ const buildGhRawUrl = (proxy, path) => {
 
 const getCustomInstallCommand = () => {
   const HOST = selectedApiBase.value
+  if (installMethod.value === INSTALL_METHOD_SYSTEMD && targetOs.value !== 'windows') {
+    return buildSystemdInstallCommand({
+      host: HOST,
+      serverId: copyServerId.value,
+      secret: apiSecret.value,
+      serverName: currentServerName.value,
+      collectInterval: collectInterval.value,
+      reportInterval: reportInterval.value,
+      connectionMode: getEffectiveConnectionMode(connectionMode.value),
+      pingMode: getEffectivePingMode(pingMode.value),
+      resetDay: resetDay.value ?? 1,
+      customCt: customCt.value,
+      customCu: customCu.value,
+      customCm: customCm.value,
+      customBd: customBd.value,
+      networkInterface: networkInterface.value,
+      ghProxy: installGhProxy.value
+    })
+  }
   const autoUpdateFlag = autoUpdate.value ? 1 : 0
   const proxy = installGhProxy.value.trim()
   const effectiveConnectionMode = getEffectiveConnectionMode(connectionMode.value)
